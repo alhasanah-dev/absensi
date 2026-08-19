@@ -20,8 +20,8 @@ const DURASI_FEEDBACK_MS = 2200;
 // Kode yang sama tidak diproses ulang selama jeda ini (mencegah satu
 // kartu ter-scan berkali-kali selagi masih di depan kamera). Kode LAIN
 // tetap bisa langsung diproses tanpa menunggu jeda ini — kamera TIDAK
-// pernah dihentikan, mengikuti pola aplikasi scanner profesional
-// (mis. scanner tiket/boarding pass) yang selalu live.
+// pernah dihentikan/dipause, mengikuti pola aplikasi scanner profesional
+// (mis. scanner tiket/boarding pass) yang video-nya selalu live.
 const COOLDOWN_PER_KODE_MS = 4000;
 
 export default function KioskClient({ petugasNama }: { petugasNama: string }) {
@@ -32,11 +32,11 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
   const sedangMemprosesRef = useRef(false);
   const riwayatKodeRef = useRef<Map<string, number>>(new Map());
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const feedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [status, setStatus] = useState<"menyiapkan" | "siap" | "error">("menyiapkan");
+  const [siap, setSiap] = useState(false);
   const [errorKamera, setErrorKamera] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const feedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const bunyikanNada = useCallback((sukses: boolean) => {
     try {
@@ -130,23 +130,20 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
     scannerRef.current = scanner;
     let dibatalkan = false;
 
-    // Kotak pemindai berbentuk kartu (landscape) meski frame kamera
-    // portrait — meniru area scan aplikasi profesional yang tidak
-    // memaksa kartu diputar 90 derajat.
-    const qrboxFn = (viewfinderWidth: number, viewfinderHeight: number) => {
-      const lebar = Math.round(Math.min(viewfinderWidth, viewfinderHeight) * 0.82);
-      const tinggi = Math.round(lebar * 0.62);
-      return { width: lebar, height: tinggi };
-    };
-
     scanner
       .start(
         { facingMode: "environment" },
         {
           fps: 12,
-          qrbox: qrboxFn,
-          aspectRatio: 3 / 4,
-          disableFlip: false,
+          // SENGAJA tidak diisi "qrbox": kalau diisi, html5-qrcode
+          // menggambar overlay/kotak pemindainya SENDIRI di atas video
+          // (kotak defaultnya landscape & ukurannya dihitung ulang dari
+          // dimensi container saat start(), yang gampang meleset dari
+          // bingkai kartu portrait yang kita gambar sendiri di bawah —
+          // itulah penyebab bug "animasi scan keluar dari frame kamera").
+          // Dengan qrbox dikosongkan, seluruh frame video dipakai untuk
+          // pemindaian, dan bingkai kartu di layar murni dekorasi CSS
+          // kita sendiri, jadi selalu presisi & tidak pernah bentrok.
         },
         (decodedText) => {
           void prosesKode(decodedText);
@@ -159,12 +156,11 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
         }
       )
       .then(() => {
-        if (!dibatalkan) setStatus("siap");
+        if (!dibatalkan) setSiap(true);
       })
       .catch((err) => {
         console.error("Gagal mengaktifkan kamera:", err);
         if (!dibatalkan) {
-          setStatus("error");
           setErrorKamera(
             "Tidak bisa mengakses kamera. Pastikan izin kamera diberikan dan halaman diakses lewat HTTPS."
           );
@@ -187,55 +183,44 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
   }, [prosesKode]);
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white flex flex-col">
-      {/* Header ala aplikasi kiosk profesional */}
-      <header className="flex items-center justify-between px-5 py-4 border-b border-white/10">
-        <div>
-          <h1 className="text-base font-semibold tracking-tight">Kiosk Absensi</h1>
-          {petugasNama && (
-            <p className="text-slate-500 text-xs mt-0.5">Perangkat: {petugasNama}</p>
-          )}
-        </div>
-        <div className="flex items-center gap-1.5 text-xs">
-          <span
-            className={`h-2 w-2 rounded-full ${
-              status === "siap"
-                ? "bg-emerald-400 animate-pulse"
-                : status === "error"
-                ? "bg-red-500"
-                : "bg-amber-400 animate-pulse"
-            }`}
-          />
-          <span className="text-slate-400">
-            {status === "siap" ? "Live" : status === "error" ? "Kamera Error" : "Menyiapkan..."}
-          </span>
-        </div>
-      </header>
+    <main className="min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center p-6">
+      <h1 className="text-2xl font-semibold mb-1">Kiosk Absensi</h1>
+      <p className="text-slate-400 mb-1 text-sm">
+        Arahkan kartu QR/barcode siswa atau pegawai ke kamera
+      </p>
+      {petugasNama && (
+        <p className="text-slate-500 mb-6 text-xs">Perangkat: {petugasNama}</p>
+      )}
 
-      {/* Area kamera portrait, memenuhi layar seperti aplikasi scan kartu profesional */}
-      <div className="relative flex-1 w-full max-w-md mx-auto overflow-hidden bg-black">
-        <div id={READER_ELEMENT_ID} className="absolute inset-0 [&>video]:!w-full [&>video]:!h-full [&>video]:!object-cover" />
+      {/* Kotak kamera: model kartu POTRAIT (lebih tinggi dari lebar),
+          menggantikan kotak persegi (aspect-square) sebelumnya. Semua
+          overlay/animasi di bawah berada DI DALAM div ini yang punya
+          overflow-hidden, jadi tidak akan pernah keluar dari bingkai. */}
+      <div className="relative w-full max-w-xs aspect-[3/4] rounded-2xl overflow-hidden border-4 border-slate-700 bg-black">
+        <div
+          id={READER_ELEMENT_ID}
+          className="absolute inset-0 [&_video]:!w-full [&_video]:!h-full [&_video]:!object-cover"
+        />
 
-        {status === "menyiapkan" && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/80 text-slate-300 text-sm">
-            <div className="h-8 w-8 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
+        {!siap && !errorKamera && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-slate-300 text-sm">
             Menyalakan kamera...
           </div>
         )}
 
-        {status === "error" && errorKamera && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/90 text-red-300 text-sm text-center p-6">
+        {errorKamera && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-red-300 text-sm text-center p-6">
             {errorKamera}
           </div>
         )}
 
-        {/* Panduan area scan + animasi garis pemindai, tampil terus selama
-            kamera live (tidak disembunyikan saat memproses hasil, supaya
-            terasa selalu aktif) */}
-        {status === "siap" && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-            <div className="relative w-[82%] aspect-[1.6/1]">
-              <div className="absolute inset-0 rounded-xl border-2 border-emerald-400/70 shadow-[0_0_0_9999px_rgba(0,0,0,0.45)]" />
+        {/* Panduan area scan berbentuk kartu potrait + animasi garis
+            pemindai — 100% dekorasi CSS kita sendiri (bukan bawaan
+            html5-qrcode), dibatasi ketat di dalam kotak kamera di atas. */}
+        {siap && !errorKamera && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
+            <div className="relative h-full w-[78%] max-w-[220px]">
+              <div className="absolute inset-0 rounded-xl border-2 border-emerald-400/70" />
               <span className="absolute -left-0.5 -top-0.5 h-6 w-6 border-l-4 border-t-4 border-emerald-400 rounded-tl-lg" />
               <span className="absolute -right-0.5 -top-0.5 h-6 w-6 border-r-4 border-t-4 border-emerald-400 rounded-tr-lg" />
               <span className="absolute -left-0.5 -bottom-0.5 h-6 w-6 border-l-4 border-b-4 border-emerald-400 rounded-bl-lg" />
@@ -247,78 +232,52 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
           </div>
         )}
 
-        <p className="pointer-events-none absolute bottom-4 left-0 right-0 text-center text-xs text-slate-300/90 px-6">
-          Arahkan kartu QR/barcode siswa atau pegawai ke dalam bingkai
-        </p>
-
-        {/* Banner hasil scan — meluncur dari atas, TIDAK menghentikan
-            video kamera di belakangnya */}
-        <div
-          className={`absolute left-0 right-0 top-0 px-4 pt-4 transition-all duration-300 ${
-            feedback ? "translate-y-0 opacity-100" : "-translate-y-6 opacity-0 pointer-events-none"
-          }`}
-        >
-          {feedback && (
-            <div
-              className={`rounded-2xl border shadow-xl backdrop-blur-md p-4 flex items-center gap-3 ${
-                feedback.status === "sukses"
-                  ? "bg-emerald-950/90 border-emerald-400/60"
-                  : "bg-red-950/90 border-red-400/60"
-              }`}
-            >
-              {feedback.status === "sukses" ? (
-                <>
-                  {feedback.hasil.foto_url ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={feedback.hasil.foto_url}
-                      alt={feedback.hasil.nama}
-                      className="w-14 h-14 rounded-full object-cover border-2 border-emerald-300 shrink-0"
-                    />
-                  ) : (
-                    <div className="w-14 h-14 shrink-0 rounded-full bg-emerald-700 flex items-center justify-center text-xl font-bold">
-                      {feedback.hasil.nama?.charAt(0) ?? "?"}
-                    </div>
-                  )}
-                  <div className="min-w-0">
-                    <div className="font-semibold truncate">{feedback.hasil.nama}</div>
-                    <div className="text-emerald-200 text-xs">{feedback.pesan}</div>
-                    {feedback.hasil.event && (
-                      <div className="text-[10px] uppercase tracking-wide text-emerald-300 mt-0.5">
-                        {feedback.hasil.event === "pulang" ? "Jam Pulang" : "Jam Masuk / Hadir"}
-                      </div>
-                    )}
+        {feedback && (
+          <div
+            className={`absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center ${
+              feedback.status === "sukses" ? "bg-emerald-900/90" : "bg-red-900/90"
+            }`}
+          >
+            {feedback.status === "sukses" ? (
+              <>
+                {feedback.hasil.foto_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={feedback.hasil.foto_url}
+                    alt={feedback.hasil.nama}
+                    className="w-24 h-24 rounded-full object-cover border-4 border-emerald-300"
+                  />
+                ) : (
+                  <div className="w-24 h-24 rounded-full bg-emerald-700 flex items-center justify-center text-3xl font-bold">
+                    {feedback.hasil.nama?.charAt(0) ?? "?"}
                   </div>
-                </>
-              ) : (
-                <>
-                  <div className="w-14 h-14 shrink-0 rounded-full bg-red-800 flex items-center justify-center text-2xl">
-                    ✕
+                )}
+                <div className="text-xl font-semibold">{feedback.hasil.nama}</div>
+                <div className="text-emerald-200 text-sm">{feedback.pesan}</div>
+                {feedback.hasil.event && (
+                  <div className="text-xs uppercase tracking-wide text-emerald-300">
+                    {feedback.hasil.event === "pulang" ? "Jam Pulang" : "Jam Masuk / Hadir"}
                   </div>
-                  <div className="text-sm font-medium text-red-100">{feedback.pesan}</div>
-                </>
-              )}
-            </div>
-          )}
-        </div>
+                )}
+              </>
+            ) : (
+              <div className="text-lg font-medium text-red-200">{feedback.pesan}</div>
+            )}
+          </div>
+        )}
       </div>
 
       <style jsx global>{`
         @keyframes scanline {
           0% {
-            top: 4%;
+            top: 2%;
           }
           50% {
-            top: 92%;
+            top: 96%;
           }
           100% {
-            top: 4%;
+            top: 2%;
           }
-        }
-        #${READER_ELEMENT_ID} video {
-          width: 100% !important;
-          height: 100% !important;
-          object-fit: cover !important;
         }
       `}</style>
     </main>

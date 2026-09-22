@@ -13,14 +13,26 @@ Di project Supabase yang sama dengan "yayasan-app", jalankan di SQL Editor
    tunggu selesai (menambah nilai enum `petugas_absensi`).
 2. `supabase/schema-absensi-kiosk-v1b.sql` — tabel `absensi_pegawai`,
    kolom `kode_barcode` di `siswa`/`guru`, dan seluruh kebijakan RLS.
+3. **`schema-presensi-guru-multi-kartu-bersama-v14.sql`** (di repo
+   "yayasan-app", bukan repo ini) — WAJIB sudah dijalankan juga.
+   Migrasi ini memindahkan sumber kartu/QR pegawai dari
+   `guru.kode_barcode` (satu kode per baris/unit) ke
+   `profiles.kode_barcode` (satu kode per ORANG, lintas semua unit
+   yang diampu — dipakai supaya guru multi-unit cukup 1 kartu), dan
+   menambahkan function `catat_hadir_pegawai(kode_barcode, waktu)`
+   yang dipakai endpoint scan pegawai di repo ini. Tanpa migrasi ini,
+   scan kartu pegawai yang dicetak setelahnya akan gagal dengan pesan
+   "Kode pegawai tidak ditemukan" karena kartunya berisi
+   `profiles.kode_barcode`, bukan `guru.kode_barcode`.
 
 Setelah itu:
 
 - Buat akun login (Supabase Auth) untuk device kiosk, lalu di tabel
   `profiles` set `role = 'petugas_absensi'` untuk akun tersebut.
-- Isi kolom `kode_barcode` pada data siswa & guru yang mau bisa
-  absen, contoh: `SW-00123` (siswa), `PG-00045` (pegawai) — inilah
-  yang dicetak jadi kartu QR/barcode fisik.
+- Isi kolom `kode_barcode` pada data siswa (tabel `siswa`) dan pada
+  data guru/staff (tabel **`profiles`**, sejak migrasi v14 di atas)
+  yang mau bisa absen, contoh: `SW-00123` (siswa), `PG-00045`
+  (pegawai) — inilah yang dicetak jadi kartu QR/barcode fisik.
 
 ## 2. Setup aplikasi
 
@@ -45,10 +57,13 @@ terpisah dari "yayasan-app", dengan env vars yang sama.
 2. Halaman `/` otomatis menyalakan kamera & mulai scan QR/barcode.
 3. Kode diawali `SW-` → dicocokkan ke `siswa.kode_barcode`, insert ke
    `presensi`. Scan kedua di hari yang sama ditolak.
-4. Kode diawali `PG-` → dicocokkan ke `guru.kode_barcode`. Scan
-   pertama hari itu = jam masuk (insert baris baru ke
-   `absensi_pegawai`); scan kedua = jam pulang (update baris yang
-   sama); scan ketiga ditolak.
+4. Kode diawali `PG-` → dicocokkan ke `profiles.kode_barcode`, lalu
+   dicatat lewat RPC `catat_hadir_pegawai`. Function ini otomatis
+   mencari SEMUA unit yang diampu pemilik kode (guru satu unit = 1
+   unit, guru_multi = beberapa unit sekaligus) dan mencatat untuk
+   setiap unit: scan pertama hari itu di unit tsb = jam masuk, scan
+   kedua = jam pulang, scan ketiga = ditolak (khusus unit yang sudah
+   lengkap; unit lain yang belum discan tetap diproses).
 5. Nama + foto tampil ± 2 detik lalu kamera otomatis lanjut scan
    lagi; kode yang tidak ditemukan menampilkan pesan error.
 
@@ -62,17 +77,21 @@ diikuti seketat mungkin, dengan satu penyesuaian yang perlu diketahui:
   `UNIQUE(siswa_id, tanggal)` yang sudah ada di tabel ini sejak
   `schema.sql` — API menangkap error `unique_violation` dari
   Postgres, bukan melakukan SELECT lebih dulu.
-- **`absensi_pegawai`: insert + SELECT/UPDATE yang dikunci ke hari
-  berjalan saja** (`tanggal = current_date`). Ini perlu sedikit lebih
-  dari insert-only murni karena scan kedua pegawai harus **mengubah**
-  baris jam masuk yang sudah ada (mengisi jam pulang), bukan membuat
-  baris baru — dan Postgres RLS mensyaratkan kebijakan SELECT agar
-  `UPDATE ... RETURNING` bisa mengonfirmasi baris mana yang berhasil
-  diubah. Cakupannya tetap dikunci ketat: tidak bisa membaca atau
-  mengubah riwayat presensi hari-hari sebelumnya.
+- **`absensi_pegawai`: sejak migrasi v14, ditulis lewat RPC
+  `catat_hadir_pegawai` (SECURITY DEFINER)**, bukan lagi
+  INSERT/UPDATE langsung dari endpoint scan — function ini yang
+  menegakkan `get_my_role() = 'petugas_absensi'` (raise exception
+  kalau bukan) dan yang menangani fan-out ke banyak unit untuk guru
+  multi-unit. Kebijakan insert/SELECT/UPDATE hari-berjalan dari v1b
+  di atas tetap ada di database (aman, tidak konflik) tapi jalur
+  scan pegawai di repo ini tidak lagi bergantung padanya.
 - Role ini juga diberi **SELECT-only** (tanpa insert/update/delete)
-  ke `siswa`, `guru`, dan `profiles`, semata untuk menampilkan nama +
-  foto setelah scan berhasil (kebutuhan poin 6 di brief).
+  ke `siswa`, `guru`, dan `profiles`, untuk menampilkan nama + foto
+  setelah scan berhasil (kebutuhan poin 6 di brief). Jalur pegawai
+  sekarang membaca nama/foto dari **`profiles`** saja (lewat
+  `profiles.kode_barcode`, kolom baru dari migrasi v14) — kebijakan
+  SELECT pada `guru` dari v1b tidak lagi dipakai jalur ini tapi tetap
+  dibiarkan ada untuk kompatibilitas/kegunaan lain.
 
 Kalau kebijakan ini ingin dibuat lebih ketat lagi (mis. SELECT di
 `siswa`/`guru`/`profiles` dibatasi hanya kolom nama+foto lewat view),

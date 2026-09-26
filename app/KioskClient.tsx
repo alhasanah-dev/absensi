@@ -2,6 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Html5Qrcode, Html5QrcodeScannerState } from "html5-qrcode";
+import { ambilRoster, segarkanRoster, tandaiSiswaSudahHadirLokal } from "@/lib/roster-cache";
+import { tambahKeAntrian, jumlahAntrian } from "@/lib/offline-queue";
+import { sinkronSekarang } from "@/lib/sync";
 
 type HasilScan = {
   tipe: "siswa" | "pegawai";
@@ -23,12 +26,16 @@ const DURASI_FEEDBACK_MS = 2200;
 // pernah dihentikan/dipause, mengikuti pola aplikasi scanner profesional
 // (mis. scanner tiket/boarding pass) yang video-nya selalu live.
 const COOLDOWN_PER_KODE_MS = 4000;
+// Seberapa sering mencoba sinkron otomatis di latar belakang (selain
+// segera setelah tiap scan siswa, dan segera saat koneksi kembali).
+const INTERVAL_AUTO_SINKRON_MS = 2 * 60 * 1000;
 
 export default function KioskClient({ petugasNama }: { petugasNama: string }) {
   const scannerRef = useRef<Html5Qrcode | null>(null);
-  // Mengunci hanya selagi ada request ke server yang sedang berjalan,
-  // supaya tidak ada dua request bersamaan — bukan untuk menghentikan
-  // kamera.
+  // Mengunci hanya selagi ada request PEGAWAI ke server yang sedang
+  // berjalan, supaya tidak ada dua request bersamaan — bukan untuk
+  // menghentikan kamera. Scan SISWA sengaja tidak memakai kunci ini
+  // karena hasilnya sudah instan dari cache lokal (lihat prosesKode).
   const sedangMemprosesRef = useRef(false);
   const riwayatKodeRef = useRef<Map<string, number>>(new Map());
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -37,6 +44,8 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
   const [siap, setSiap] = useState(false);
   const [errorKamera, setErrorKamera] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [jumlahBelumSinkron, setJumlahBelumSinkron] = useState(0);
+  const [sedangSinkron, setSedangSinkron] = useState(false);
 
   const bunyikanNada = useCallback((sukses: boolean) => {
     try {
@@ -72,8 +81,103 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
     }
   }, []);
 
+  const tampilkanFeedback = useCallback(
+    (f: Feedback) => {
+      setFeedback(f);
+      bunyikanNada(f.status === "sukses");
+      if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
+      feedbackTimeoutRef.current = setTimeout(() => setFeedback(null), DURASI_FEEDBACK_MS);
+    },
+    [bunyikanNada]
+  );
+
+  const jalankanSinkron = useCallback(async () => {
+    setSedangSinkron(true);
+    try {
+      await sinkronSekarang();
+    } finally {
+      setJumlahBelumSinkron(jumlahAntrian());
+      setSedangSinkron(false);
+    }
+  }, []);
+
+  // ---- Jalur SISWA: instan dari cache lokal, tanpa menunggu jaringan ----
+  const prosesSiswaOptimistis = useCallback(
+    (kode: string, waktuScan: string) => {
+      const roster = ambilRoster();
+      const orang = roster?.siswa[kode];
+
+      if (!orang) {
+        tampilkanFeedback({
+          status: "gagal",
+          pesan: 'Kode tidak ditemukan di data lokal. Coba tekan "Sinkron Sekarang".',
+        });
+        return;
+      }
+
+      if (roster?.siswaSudahHadir[orang.id]) {
+        tampilkanFeedback({ status: "gagal", pesan: `${orang.nama} sudah presensi hari ini.` });
+        return;
+      }
+
+      tandaiSiswaSudahHadirLokal(orang.id);
+      tambahKeAntrian(kode, waktuScan, "siswa");
+      setJumlahBelumSinkron((n) => n + 1);
+      tampilkanFeedback({
+        status: "sukses",
+        hasil: { tipe: "siswa", nama: orang.nama, foto_url: orang.foto_url, event: "hadir" },
+        pesan: "Presensi berhasil dicatat.",
+      });
+
+      // Kirim ke server di LATAR BELAKANG — sengaja tidak ditunggu di
+      // sini supaya kamera langsung siap memindai kartu berikutnya
+      // tanpa jeda jaringan. Kalau gagal (offline), scan ini tetap
+      // aman di antrian sampai sinkron berikutnya berhasil.
+      void jalankanSinkron();
+    },
+    [tampilkanFeedback, jalankanSinkron]
+  );
+
+  // ---- Jalur PEGAWAI: tetap online (lihat lib/roster-cache.ts untuk
+  // alasannya), tapi sekarang cuma 1 round-trip, dan tetap aman masuk
+  // antrian offline kalau kebetulan koneksi lagi putus. ----
+  const prosesPegawaiOnline = useCallback(
+    async (kode: string, waktuScan: string) => {
+      try {
+        const res = await fetch("/api/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kode, waktu: waktuScan }),
+        });
+        const json = await res.json().catch(() => null);
+
+        if (json?.ok) {
+          tampilkanFeedback({ status: "sukses", hasil: json.data, pesan: json.pesan });
+        } else {
+          tampilkanFeedback({ status: "gagal", pesan: json?.pesan ?? "Kode tidak dikenali." });
+        }
+      } catch (err) {
+        console.error(err);
+        // Koneksi bermasalah — jangan sampai scan pegawai hilang begitu
+        // saja: simpan ke antrian yang sama dengan siswa. Aksi persisnya
+        // (masuk/pulang/per-unit) baru dipastikan server saat sinkron
+        // nanti, jadi pesannya di sini sengaja umum.
+        const roster = ambilRoster();
+        const orang = roster?.pegawai[kode];
+        tambahKeAntrian(kode, waktuScan, "pegawai");
+        setJumlahBelumSinkron((n) => n + 1);
+        tampilkanFeedback({
+          status: "sukses",
+          hasil: { tipe: "pegawai", nama: orang?.nama ?? "Pegawai", foto_url: orang?.foto_url },
+          pesan: "Koneksi bermasalah — tersimpan, akan diproses otomatis saat tersambung lagi.",
+        });
+      }
+    },
+    [tampilkanFeedback]
+  );
+
   const prosesKode = useCallback(
-    async (kodeMentah: string) => {
+    (kodeMentah: string) => {
       const kode = kodeMentah.trim();
       if (!kode) return;
 
@@ -83,47 +187,49 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
         // Kartu yang sama masih di depan kamera — abaikan, kamera tetap live.
         return;
       }
-      if (sedangMemprosesRef.current) {
-        // Ada request lain yang sedang berjalan; jangan tumpang tindih.
+      riwayatKodeRef.current.set(kode, sekarangTs);
+      const waktuScan = new Date().toISOString();
+
+      if (kode.startsWith("SW-")) {
+        prosesSiswaOptimistis(kode, waktuScan);
         return;
       }
 
-      sedangMemprosesRef.current = true;
-      riwayatKodeRef.current.set(kode, sekarangTs);
-
-      try {
-        const res = await fetch("/api/scan", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ kode }),
+      if (kode.startsWith("PG-")) {
+        if (sedangMemprosesRef.current) return; // request pegawai lain masih berjalan
+        sedangMemprosesRef.current = true;
+        void prosesPegawaiOnline(kode, waktuScan).finally(() => {
+          sedangMemprosesRef.current = false;
         });
-        const json = await res.json().catch(() => null);
-
-        if (json?.ok) {
-          setFeedback({ status: "sukses", hasil: json.data, pesan: json.pesan });
-          bunyikanNada(true);
-        } else {
-          setFeedback({
-            status: "gagal",
-            pesan: json?.pesan ?? "Kode tidak dikenali.",
-          });
-          bunyikanNada(false);
-        }
-      } catch (err) {
-        console.error(err);
-        setFeedback({ status: "gagal", pesan: "Koneksi bermasalah, coba lagi." });
-        bunyikanNada(false);
+        return;
       }
 
-      sedangMemprosesRef.current = false;
-
-      if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
-      feedbackTimeoutRef.current = setTimeout(() => {
-        setFeedback(null);
-      }, DURASI_FEEDBACK_MS);
+      tampilkanFeedback({
+        status: "gagal",
+        pesan: 'Format kode tidak dikenali (harus diawali "SW-" atau "PG-").',
+      });
     },
-    [bunyikanNada]
+    [prosesSiswaOptimistis, prosesPegawaiOnline, tampilkanFeedback]
   );
+
+  // ---- Roster + sinkron: dimuat saat kiosk dibuka, lalu disegarkan
+  // berkala, saat koneksi kembali, dan lewat tombol manual. ----
+  useEffect(() => {
+    setJumlahBelumSinkron(jumlahAntrian());
+    void segarkanRoster().then(() => setJumlahBelumSinkron(jumlahAntrian()));
+
+    const interval = setInterval(() => {
+      void jalankanSinkron();
+    }, INTERVAL_AUTO_SINKRON_MS);
+
+    const saatOnline = () => void jalankanSinkron();
+    window.addEventListener("online", saatOnline);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("online", saatOnline);
+    };
+  }, [jalankanSinkron]);
 
   useEffect(() => {
     const scanner = new Html5Qrcode(READER_ELEMENT_ID, { verbose: false });
@@ -146,7 +252,7 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
           // kita sendiri, jadi selalu presisi & tidak pernah bentrok.
         },
         (decodedText) => {
-          void prosesKode(decodedText);
+          prosesKode(decodedText);
         },
         () => {
           // callback error per-frame (dipanggil terus saat tidak ada kode
@@ -183,7 +289,28 @@ export default function KioskClient({ petugasNama }: { petugasNama: string }) {
   }, [prosesKode]);
 
   return (
-    <main className="min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center p-6">
+    <main className="relative min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center p-6">
+      {/* Status sinkron: badge jumlah yang belum tersinkron (kalau ada)
+          + tombol paksa sinkron sekarang. Data tetap tersimpan aman di
+          antrian lokal dan otomatis dicoba lagi berkala / saat koneksi
+          kembali, jadi tombol ini murni jaminan/kontrol manual — bukan
+          satu-satunya jalan data sampai ke server. */}
+      <div className="absolute right-3 top-3 z-10 flex items-center gap-2">
+        {jumlahBelumSinkron > 0 && (
+          <span className="rounded-full bg-amber-500 px-2.5 py-1 text-xs font-semibold text-slate-900">
+            {jumlahBelumSinkron} belum tersinkron
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => void jalankanSinkron()}
+          disabled={sedangSinkron}
+          className="rounded-full border border-white/20 bg-white/10 px-3 py-1 text-xs font-medium text-white hover:bg-white/20 disabled:opacity-50"
+        >
+          {sedangSinkron ? "Menyinkron..." : "Sinkron Sekarang"}
+        </button>
+      </div>
+
       <h1 className="text-2xl font-semibold mb-1">Kiosk Absensi</h1>
       <p className="text-slate-400 mb-1 text-sm">
         Arahkan kartu QR/barcode siswa atau pegawai ke kamera

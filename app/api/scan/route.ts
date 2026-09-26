@@ -1,15 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { getTanggalHariIniJakarta } from "@/lib/date";
-
-const KODE_UNIQUE_VIOLATION = "23505";
 
 export async function POST(req: NextRequest) {
   const supabase = await createClient();
 
   // Wajib login sebagai petugas_absensi — sesi diambil dari cookie
-  // device kiosk. RLS di database yang menegakkan hak akses
-  // sebenarnya; ini cuma penolakan dini supaya pesannya jelas.
+  // device kiosk. RLS + pengecekan role di dalam RPC yang menegakkan
+  // hak akses sebenarnya; ini cuma penolakan dini supaya pesannya jelas.
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -23,6 +20,7 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => null);
   const kodeRaw = body?.kode;
+  const waktuRaw = body?.waktu;
 
   if (!kodeRaw || typeof kodeRaw !== "string") {
     return NextResponse.json(
@@ -32,11 +30,17 @@ export async function POST(req: NextRequest) {
   }
 
   const kode = kodeRaw.trim();
-  const tanggal = getTanggalHariIniJakarta();
-  const sekarang = new Date().toISOString();
+
+  // `waktu` cuma dikirim saat me-replay scan yang sempat tersimpan di
+  // antrian offline (lihat lib/sync.ts) — supaya jam yang tercatat di
+  // database adalah jam SAAT KARTU DI-SCAN, bukan jam saat perangkat
+  // berhasil tersambung internet lagi. Kalau tidak dikirim/tidak valid
+  // (jalur online biasa), pakai jam server sekarang seperti biasa.
+  const waktuValid = typeof waktuRaw === "string" && !Number.isNaN(Date.parse(waktuRaw));
+  const sekarang = waktuValid ? new Date(waktuRaw).toISOString() : new Date().toISOString();
 
   if (kode.startsWith("SW-")) {
-    return prosesScanSiswa(supabase, kode, tanggal, sekarang);
+    return prosesScanSiswa(supabase, kode, sekarang);
   }
 
   if (kode.startsWith("PG-")) {
@@ -52,90 +56,94 @@ export async function POST(req: NextRequest) {
   );
 }
 
+type CatatHadirSiswaRow = {
+  out_siswa_id: string;
+  out_nama_lengkap: string;
+  out_foto_url: string | null;
+  aksi: "hadir" | "sudah_hadir" | "nonaktif";
+};
+
 async function prosesScanSiswa(
   supabase: Awaited<ReturnType<typeof createClient>>,
   kode: string,
-  tanggal: string,
   sekarang: string
 ) {
-  const { data: siswa, error: siswaError } = await supabase
-    .from("siswa")
-    .select("id, nama_lengkap, foto_url, status")
-    .eq("kode_barcode", kode)
-    .maybeSingle();
-
-  if (siswaError || !siswa) {
-    return NextResponse.json(
-      { ok: false, pesan: "Kode siswa tidak ditemukan." },
-      { status: 404 }
-    );
-  }
-
-  if (siswa.status !== "aktif") {
-    return NextResponse.json(
-      {
-        ok: false,
-        pesan: `Data siswa berstatus "${siswa.status}", tidak bisa presensi.`,
-      },
-      { status: 409 }
-    );
-  }
-
-  const { error: insertError } = await supabase.from("presensi").insert({
-    siswa_id: siswa.id,
-    tanggal,
-    status: "hadir",
-    sumber: "kiosk",
-    waktu_hadir: sekarang,
+  // Satu round-trip: RPC ini mencari siswa DAN mencatat presensinya
+  // sekaligus (lihat supabase/schema-kiosk-satu-roundtrip-v20.sql di
+  // repo yayasan-app).
+  const { data: hasil, error: rpcError } = await supabase.rpc("catat_hadir_siswa", {
+    p_kode_barcode: kode,
+    p_waktu: sekarang,
   });
 
-  if (insertError) {
-    if (insertError.code === KODE_UNIQUE_VIOLATION) {
+  if (rpcError) {
+    if (rpcError.message?.includes("tidak ditemukan")) {
       return NextResponse.json(
-        {
-          ok: false,
-          pesan: "Siswa ini sudah presensi hari ini.",
-          data: {
-            tipe: "siswa",
-            nama: siswa.nama_lengkap,
-            foto_url: siswa.foto_url,
-          },
-        },
-        { status: 409 }
+        { ok: false, pesan: "Kode siswa tidak ditemukan." },
+        { status: 404 }
       );
     }
-    console.error("Gagal insert presensi:", insertError);
+    console.error("Gagal memanggil catat_hadir_siswa:", rpcError);
     return NextResponse.json(
       { ok: false, pesan: "Gagal menyimpan presensi." },
       { status: 500 }
     );
   }
 
+  const r = ((hasil ?? []) as CatatHadirSiswaRow[])[0];
+
+  if (!r) {
+    return NextResponse.json(
+      { ok: false, pesan: "Kode siswa tidak ditemukan." },
+      { status: 404 }
+    );
+  }
+
+  const nama = r.out_nama_lengkap;
+  const fotoUrl = r.out_foto_url;
+
+  if (r.aksi === "nonaktif") {
+    return NextResponse.json(
+      {
+        ok: false,
+        pesan: "Data siswa tidak aktif, tidak bisa presensi.",
+        data: { tipe: "siswa", nama, foto_url: fotoUrl },
+      },
+      { status: 409 }
+    );
+  }
+
+  if (r.aksi === "sudah_hadir") {
+    return NextResponse.json(
+      {
+        ok: false,
+        pesan: `${nama} sudah presensi hari ini.`,
+        data: { tipe: "siswa", nama, foto_url: fotoUrl },
+      },
+      { status: 409 }
+    );
+  }
+
   return NextResponse.json({
     ok: true,
     pesan: "Presensi berhasil dicatat.",
-    data: {
-      tipe: "siswa",
-      nama: siswa.nama_lengkap,
-      foto_url: siswa.foto_url,
-      event: "hadir",
-      waktu: sekarang,
-    },
+    data: { tipe: "siswa", nama, foto_url: fotoUrl, event: "hadir", waktu: sekarang },
   });
 }
 
 // Baris yang dikembalikan RPC catat_hadir_pegawai — satu baris per unit
 // yang diampu pemilik kode (guru satu unit = 1 baris, guru_multi = N
 // baris, satu per unit yang diajar).
-type CatatHadirRow = {
+type CatatHadirPegawaiRow = {
   out_guru_id: string;
   out_unit_id: string;
   out_unit_nama: string;
   out_nama_lengkap: string;
+  out_avatar_url: string | null;
   aksi: "masuk" | "masuk_koreksi" | "pulang" | "sudah_lengkap";
 };
 
-function labelAksi(aksi: CatatHadirRow["aksi"]): string {
+function labelAksi(aksi: CatatHadirPegawaiRow["aksi"]): string {
   switch (aksi) {
     case "masuk":
       return "Masuk";
@@ -153,43 +161,21 @@ async function prosesScanPegawai(
   kode: string,
   sekarang: string
 ) {
-  // PENTING: sejak migrasi "guru multi kartu bersama" di yayasan-app
-  // (schema-presensi-guru-multi-kartu-bersama-v14.sql), kartu/QR
-  // pegawai dibuat dari `profiles.kode_barcode` — SATU kode per ORANG,
-  // dipakai lintas semua unit yang diampu — BUKAN `guru.kode_barcode`
-  // lagi (itu satu kode per BARIS/unit, sumber bug "Kode pegawai tidak
-  // ditemukan": kartu baru yang dicetak dari profiles.kode_barcode
-  // tidak akan pernah cocok saat dicari di kolom guru.kode_barcode).
-  // Lookup nama+foto lewat `profiles` di sini supaya konsisten dengan
-  // sumber kartu yang sekarang berlaku.
-  const { data: profil, error: profilError } = await supabase
-    .from("profiles")
-    .select("full_name, avatar_url")
-    .eq("kode_barcode", kode)
-    .maybeSingle();
-
-  if (profilError || !profil) {
-    return NextResponse.json(
-      { ok: false, pesan: "Kode pegawai tidak ditemukan." },
-      { status: 404 }
-    );
-  }
-
-  const nama = profil.full_name ?? "(tanpa nama)";
-  const fotoUrl = profil.avatar_url ?? null;
-
-  // catat_hadir_pegawai (SECURITY DEFINER RPC) mencari SEMUA baris
-  // `guru` (semua unit) milik profil yang kodenya di-scan, lalu
-  // mengisi/mengupdate absensi_pegawai untuk SETIAP unit tsb dalam satu
-  // transaksi — guru satu unit biasa tetap bekerja normal karena
-  // tinggal 1 baris yang diproses. Ini juga yang menegakkan otorisasi
-  // role petugas_absensi (raise exception kalau bukan role tsb).
+  // Satu round-trip juga di sini: RPC sekarang ikut mengembalikan
+  // out_avatar_url, jadi SELECT terpisah ke `profiles` sebelum ini
+  // (yang ada di versi lama) sudah tidak diperlukan lagi.
   const { data: hasil, error: rpcError } = await supabase.rpc(
     "catat_hadir_pegawai",
     { p_kode_barcode: kode, p_waktu: sekarang }
   );
 
   if (rpcError) {
+    if (rpcError.message?.includes("tidak ditemukan")) {
+      return NextResponse.json(
+        { ok: false, pesan: "Kode pegawai tidak ditemukan." },
+        { status: 404 }
+      );
+    }
     console.error("Gagal memanggil catat_hadir_pegawai:", rpcError);
     return NextResponse.json(
       { ok: false, pesan: "Gagal menyimpan presensi." },
@@ -197,15 +183,17 @@ async function prosesScanPegawai(
     );
   }
 
-  const baris = (hasil ?? []) as CatatHadirRow[];
+  const baris = (hasil ?? []) as CatatHadirPegawaiRow[];
 
   if (baris.length === 0) {
-    // Profil ditemukan tapi belum ada baris `guru` di unit manapun.
     return NextResponse.json(
       { ok: false, pesan: "Pegawai ini belum terdaftar pada unit manapun." },
       { status: 404 }
     );
   }
+
+  const nama = baris[0].out_nama_lengkap;
+  const fotoUrl = baris[0].out_avatar_url;
 
   if (baris.every((b) => b.aksi === "sudah_lengkap")) {
     return NextResponse.json(

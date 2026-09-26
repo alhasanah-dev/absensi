@@ -24,6 +24,14 @@ Di project Supabase yang sama dengan "yayasan-app", jalankan di SQL Editor
    scan kartu pegawai yang dicetak setelahnya akan gagal dengan pesan
    "Kode pegawai tidak ditemukan" karena kartunya berisi
    `profiles.kode_barcode`, bukan `guru.kode_barcode`.
+4. **`schema-kiosk-satu-roundtrip-v20.sql`** (di repo "yayasan-app")
+   — WAJIB juga. Menambah function `catat_hadir_siswa(kode_barcode,
+   waktu)` (setara `catat_hadir_pegawai` tapi untuk siswa) dan
+   menambah kolom hasil `out_avatar_url` ke `catat_hadir_pegawai` yang
+   sudah ada — keduanya dipakai endpoint scan di repo ini supaya 1
+   scan = 1 round-trip ke database, bukan 2. Tanpa migrasi ini,
+   endpoint `/api/scan` & `/api/roster` di repo ini akan gagal
+   memanggil RPC yang belum ada.
 
 Setelah itu:
 
@@ -54,11 +62,16 @@ terpisah dari "yayasan-app", dengan env vars yang sama.
 
 1. Device login sekali di `/login` pakai akun `petugas_absensi` —
    sesi tersimpan di cookie browser device.
-2. Halaman `/` otomatis menyalakan kamera & mulai scan QR/barcode.
-3. Kode diawali `SW-` → dicocokkan ke `siswa.kode_barcode`, insert ke
-   `presensi`. Scan kedua di hari yang sama ditolak.
-4. Kode diawali `PG-` → dicocokkan ke `profiles.kode_barcode`, lalu
-   dicatat lewat RPC `catat_hadir_pegawai`. Function ini otomatis
+2. Halaman `/` mengambil data roster (nama/foto siswa+pegawai +
+   siapa saja yang sudah presensi hari ini) ke cache lokal
+   (`localStorage`, lihat bagian 4), lalu menyalakan kamera & mulai
+   scan QR/barcode.
+3. Kode diawali `SW-` → dicocokkan ke cache lokal (BUKAN query ke
+   database — lihat bagian 4), hasilnya tampil seketika. Scan kedua
+   di hari yang sama untuk siswa yang sama ditolak (dicek dari cache
+   yang sama). Hasilnya baru dikirim ke database di latar belakang.
+4. Kode diawali `PG-` → tetap dicocokkan online lewat RPC
+   `catat_hadir_pegawai` (1 round-trip). Function ini otomatis
    mencari SEMUA unit yang diampu pemilik kode (guru satu unit = 1
    unit, guru_multi = beberapa unit sekaligus) dan mencatat untuk
    setiap unit: scan pertama hari itu di unit tsb = jam masuk, scan
@@ -67,7 +80,42 @@ terpisah dari "yayasan-app", dengan env vars yang sama.
 5. Nama + foto tampil ± 2 detik lalu kamera otomatis lanjut scan
    lagi; kode yang tidak ditemukan menampilkan pesan error.
 
-## 4. Catatan tentang RLS `petugas_absensi`
+## 4. Cache roster + antrian offline (kenapa scan terasa instan)
+
+Sebelumnya setiap scan = 2 kali bolak-balik ke Supabase (cari
+orangnya, baru simpan presensinya), yang terasa lambat saat antrian
+siswa mengular tiap pagi. Sekarang:
+
+- **`GET /api/roster`** mengirim seluruh data siswa+pegawai aktif
+  (kode_barcode, nama, foto) + daftar siswa yang sudah presensi hari
+  ini. Dipanggil (lewat `lib/roster-cache.ts`) saat kiosk dibuka, tiap
+  2 menit di latar belakang, saat koneksi kembali (`online` event),
+  dan lewat tombol "Sinkron Sekarang" di pojok kanan atas layar kiosk.
+- **Scan SISWA dicocokkan ke cache ini, bukan ke database** — jadi
+  instan tanpa menunggu jaringan sama sekali. Hasilnya (`lib/offline-
+  queue.ts`) masuk ke antrian di `localStorage`, lalu dikirim ke
+  `/api/scan` di latar belakang; kalau gagal (offline), tetap aman di
+  antrian dan dicoba lagi otomatis — TIDAK hilang.
+- **Scan PEGAWAI sengaja TETAP online** (bukan dari cache) karena
+  aturan guru multi-unit ("kartu bersama") cukup rumit dan sudah
+  ditegakkan di `catat_hadir_pegawai` — menduplikasinya ke JavaScript
+  berisiko dua tempat itu tidak sinkron kalau aturannya berubah. Kalau
+  kebetulan koneksi putus pas pegawai scan, tetap masuk antrian yang
+  sama (pesan "tersimpan, akan diproses saat tersambung"), tapi
+  aksinya (masuk/pulang/per-unit) baru dipastikan server saat sinkron.
+- Badge "N belum tersinkron" di pojok kanan atas menunjukkan kalau
+  ada scan yang masih menunggu terkirim — kalau angkanya tidak
+  kunjung turun, device kemungkinan sedang offline lebih dari
+  beberapa menit.
+- **Konsekuensi yang perlu disadari:** siswa/pegawai yang BARU
+  ditambahkan/diubah kodenya di dashboard tidak akan langsung
+  dikenali kiosk sampai roster tersegarkan (maks. ± 2 menit, atau
+  langsung lewat tombol Sinkron). Dan kalau `localStorage` perangkat
+  sampai terhapus (reset browser, dsb.) SEBELUM sempat sinkron, scan
+  yang masih di antrian ikut hilang — makanya sinkron otomatis
+  berjalan seagresif ini by default, bukan cuma manual.
+
+## 5. Catatan tentang RLS `petugas_absensi`
 
 Diminta "RLS hanya boleh insert" untuk role `petugas_absensi`. Ini
 diikuti seketat mungkin, dengan satu penyesuaian yang perlu diketahui:
@@ -98,7 +146,7 @@ Kalau kebijakan ini ingin dibuat lebih ketat lagi (mis. SELECT di
 tinggal ganti kebijakan `*_select_by_petugas_absensi` di
 `schema-absensi-kiosk-v1b.sql` untuk mengarah ke view tersebut.
 
-## 5. Akses dari device kiosk lewat jaringan lokal (dev)
+## 6. Akses dari device kiosk lewat jaringan lokal (dev)
 
 `next.config.mjs` otomatis mendeteksi semua IP jaringan lokal
 komputer kamu (lewat `os.networkInterfaces()`) setiap kali
@@ -126,7 +174,7 @@ development, opsinya:
 - Di **produksi** (Vercel dsb.) ini otomatis bukan masalah karena
   domainnya sudah HTTPS asli.
 
-## 6. Kenapa tidak pakai Service Role Key
+## 7. Kenapa tidak pakai Service Role Key
 
 Berbeda dari `lib/supabase/admin.ts` di "yayasan-app", aplikasi kiosk
 ini sengaja **tidak** memakai Service Role Key sama sekali — semua
